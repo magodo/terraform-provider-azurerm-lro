@@ -5,6 +5,8 @@ import (
 	"go/ast"
 	"go/types"
 	"os"
+	"path/filepath"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 )
@@ -21,6 +23,7 @@ func main() {
 	}
 
 	// Collect Go Track1 function declarations that returns
+	pwd, _ := os.Getwd()
 	for _, pkg := range pkgs {
 		for _, f := range pkg.Syntax {
 			ast.Inspect(f, func(node ast.Node) bool {
@@ -69,7 +72,7 @@ func main() {
 				if future.Name() != "FutureAPI" || future.Pkg().Path() != "github.com/Azure/go-autorest/autorest/azure" {
 					return true
 				}
-				fmt.Println(pkg.Fset.Position(asnmt.Pos()))
+				fmt.Println(strings.TrimPrefix(pkg.Fset.Position(asnmt.Pos()).String(), pwd+string(filepath.Separator)))
 				return false
 			})
 		}

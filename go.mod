@@ -1,6 +1,6 @@
 module github.com/magodo/terraform-provider-azurerm-lro
 
-go 1.17
+go 1.18
 
 require golang.org/x/tools v0.1.9
 

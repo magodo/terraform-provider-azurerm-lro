@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,11 +17,41 @@ import (
 func main() {
 	cfg := &packages.Config{Mode: packages.LoadSyntax}
 
-	// nanxu Test Func
-	fmt.Printf("%s: %d\n", os.Args[1], len(os.Args[1:]))
-	test(os.Args[1:]...)
+	//nanxu below are origin
+	//pkgs, err := packages.Load(cfg, os.Args[1:]...)
 
-	pkgs, err := packages.Load(cfg, os.Args[1:]...)
+	var inScopePkgPaths []string
+
+	pwd, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load: %v\n", err)
+		os.Exit(1)
+	}
+
+	pkgPreFix := "github.com/hashicorp/terraform-provider-azurerm/internal/services/"
+
+	filepath.WalkDir(pwd, func(path string, di fs.DirEntry, err error) error {
+		if di.IsDir() {
+			pathSeg := strings.Split(path, string(filepath.Separator))
+
+			// Only regard top folder (e.g. network) underneath "terraform-provider-azurerm/internal/services" as in scope (e.g. w/o network/client or network/path)
+			if len(pathSeg) > 0 && pathSeg[len(pathSeg)-2] == "services" {
+
+				//nanxu
+				if di.Name() != "keyvault" {
+					inScopePkgPaths = append(inScopePkgPaths, pkgPreFix+di.Name())
+
+					//nanxu
+					fmt.Printf("Visited: %s \n", path)
+				}
+
+			}
+		}
+
+		return nil
+	})
+
+	pkgs, err := packages.Load(cfg, inScopePkgPaths...)
 
 	//nanxu
 	//pkgs, err := packages.Load(cfg, "D:\\code\\terraform-provider-azurerm\\internal\\services\\network", "D:\\code\\terraform-provider-azurerm\\internal\\services\\eventhub")
@@ -33,8 +64,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	pwd, _ := os.Getwd()
-
 	/*
 		There are pkgs, e.g. the current COMPUTE pkg, that use both T1 and Pandora SDK, so scan both of them.
 		Scanning both SDKs within one pkg introduces duplicate AST traversal, while optimizing that is yet done.
@@ -44,6 +73,11 @@ func main() {
 		trackOneSDKScan(pkg, pwd)
 		pandoraSDKScan(pkg, pwd)
 	}
+}
+
+func visit(path string, di fs.DirEntry, err error) error {
+	fmt.Printf("Visited: %s\n", path)
+	return nil
 }
 
 func test(args ...string) {
@@ -225,14 +259,6 @@ func pandoraSDKScan(pkg *packages.Package, rootPath string) {
 			funcRecvType := signature.Recv().Type().String()
 			funcPkg := funcObj.Pkg()
 
-			// nanxu
-			// fmt.Printf("RAW PKG: %s | Func: %s | Recv: %s\n", funcPkg.Name(), selExpr.Sel.Name, funcRecvType)
-
-			// nanxu debug
-			if funcRecvType == "github.com/Azure/azure-sdk-for-go/services/preview/botservice/mgmt/2021-05-01-preview/botservice.BotsClient" {
-				fmt.Printf("stop: %d\n", len(funcScanCache[funcRecvType]))
-			}
-
 			// Use cache to reduce unnecessary ast traversal
 			if len(funcScanCache[funcRecvType]) > 0 {
 				pollFuncList := funcScanCache[funcRecvType]
@@ -245,9 +271,6 @@ func pandoraSDKScan(pkg *packages.Package, rootPath string) {
 
 				return false
 			}
-
-			// nanxu
-			//fmt.Printf("RAW2 PKG: %s | Func: %s | Recv: %s\n", funcPkg.Name(), selExpr.Sel.Name, funcRecvType)
 
 			// Get Pandora SDK package containing the being called synchronized CRUD function, and verify whether there is also `ThenPoll()` function.
 			// If there is, then it's bug.

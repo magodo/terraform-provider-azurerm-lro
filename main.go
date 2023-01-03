@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	cfg := &packages.Config{Mode: packages.LoadSyntax}
+	cfg := &packages.Config{Mode: packages.LoadAllSyntax}
 	pkgs, err := packages.Load(cfg, os.Args[1:]...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load: %v\n", err)

@@ -4,58 +4,23 @@ import (
 	"fmt"
 	"go/ast"
 	"go/types"
-	"io/fs"
+	"golang.org/x/tools/go/packages"
 	"os"
 	"path/filepath"
 	"strings"
-
-	"golang.org/x/tools/go/packages"
+	"unicode"
 )
 
-// nanxu: THere could be false alert that code using sync CRUD but have future to accept and write customzied async
-
 func main() {
-	cfg := &packages.Config{Mode: packages.LoadSyntax}
-
-	//nanxu below are origin
-	//pkgs, err := packages.Load(cfg, os.Args[1:]...)
-
-	var inScopePkgPaths []string
-
 	pwd, err := os.Getwd()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load: %v\n", err)
 		os.Exit(1)
 	}
 
-	pkgPreFix := "github.com/hashicorp/terraform-provider-azurerm/internal/services/"
+	cfg := &packages.Config{Mode: packages.LoadAllSyntax}
 
-	filepath.WalkDir(pwd, func(path string, di fs.DirEntry, err error) error {
-		if di.IsDir() {
-			pathSeg := strings.Split(path, string(filepath.Separator))
-
-			// Only regard top folder (e.g. network) underneath "terraform-provider-azurerm/internal/services" as in scope (e.g. w/o network/client or network/path)
-			if len(pathSeg) > 0 && pathSeg[len(pathSeg)-2] == "services" {
-
-				//nanxu
-				if di.Name() != "keyvault" {
-					inScopePkgPaths = append(inScopePkgPaths, pkgPreFix+di.Name())
-
-					//nanxu
-					fmt.Printf("Visited: %s \n", path)
-				}
-
-			}
-		}
-
-		return nil
-	})
-
-	pkgs, err := packages.Load(cfg, inScopePkgPaths...)
-
-	//nanxu
-	//pkgs, err := packages.Load(cfg, "D:\\code\\terraform-provider-azurerm\\internal\\services\\network", "D:\\code\\terraform-provider-azurerm\\internal\\services\\eventhub")
-
+	pkgs, err := packages.Load(cfg, os.Args[1:]...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "load: %v\n", err)
 		os.Exit(1)
@@ -64,77 +29,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	/*
-		There are pkgs, e.g. the current COMPUTE pkg, that use both T1 and Pandora SDK, so scan both of them.
-		Scanning both SDKs within one pkg introduces duplicate AST traversal, while optimizing that is yet done.
-	*/
 	for _, pkg := range pkgs {
-		fmt.Printf("%s\n", pkg.Name)
 		trackOneSDKScan(pkg, pwd)
 		pandoraSDKScan(pkg, pwd)
 	}
 }
-
-func visit(path string, di fs.DirEntry, err error) error {
-	fmt.Printf("Visited: %s\n", path)
-	return nil
-}
-
-func test(args ...string) {
-	for _, v := range args {
-		fmt.Printf("%s\n", v)
-	}
-}
-
-// Enable below checking logic later when one pkg uses either Track1 or Pandora, rather than both. This can help reduce duplicate AST traversal.
-/*
-func isTrackOnePkg(pkg *packages.Package) bool {
-	ret := true
-	stopAstTraverse := false
-
-	for _, f := range pkg.Syntax {
-		ast.Inspect(f, func(node ast.Node) bool {
-
-			// With the assumption that one pkg uses either Track1 or Pandora, rather than both,
-			// below iteration introduces unnecessary traversal, instead, the first occurrence of access is enough.
-			// However, `ast.Inspect()` does not provide a way to escape?
-			if stopAstTraverse {
-				return true
-			}
-
-			asnmt, ok := node.(*ast.AssignStmt)
-			if !ok {
-				return true
-			}
-
-			callExpr, ok := asnmt.Rhs[0].(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-
-			selExpr, ok := callExpr.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-
-			funcObj := pkg.TypesInfo.Uses[selExpr.Sel]
-
-			if strings.Contains(funcObj.Pkg().Path(), "/kermit/") ||
-				strings.Contains(funcObj.Pkg().Path(), "/Azure/azure-sdk-for-go/") {
-				fmt.Printf("Kermit/Track 1 SDK: %s\n", funcObj.Pkg().Path())
-			} else {
-				ret = false
-			}
-
-			stopAstTraverse = true
-
-			return true
-		})
-	}
-
-	return ret
-}
-*/
 
 func trackOneSDKScan(pkg *packages.Package, rootPath string) {
 	for _, f := range pkg.Syntax {
@@ -165,7 +64,14 @@ func trackOneSDKScan(pkg *packages.Package, rootPath string) {
 			if !ok {
 				return true
 			}
-			funcObj := pkg.TypesInfo.Uses[selExpr.Sel]
+
+			if pkg.TypesInfo == nil {
+				return true
+			}
+			funcObj, ok := pkg.TypesInfo.Uses[selExpr.Sel]
+			if !ok {
+				return true
+			}
 
 			signature, ok := funcObj.Type().(*types.Signature)
 			if !ok {
@@ -196,152 +102,105 @@ func trackOneSDKScan(pkg *packages.Package, rootPath string) {
 }
 
 func pandoraSDKScan(pkg *packages.Package, rootPath string) {
-	funcScanCache := make(map[string][]string)
+	usesSet := map[types.Object][]string{}
 
-	for _, f := range pkg.Syntax {
-		ast.Inspect(f, func(node ast.Node) bool {
-			asnmt, ok := node.(*ast.AssignStmt)
+	// Collect Uses
+	for ident, def := range pkg.TypesInfo.Uses {
+		if !strings.Contains(ident.Name, "Create") &&
+			!strings.Contains(ident.Name, "CreateOrUpdate") &&
+			!strings.Contains(ident.Name, "Update") &&
+			!strings.Contains(ident.Name, "Delete") {
+			continue
+		}
+
+		// Only identify those Sync calls in Uses
+		if strings.Contains(ident.Name, "ThenPoll") {
+			continue
+		}
+
+		// Only identify Methods in Uses
+		_, ok := def.Type().(*types.Signature)
+		if !ok {
+			continue
+		}
+
+		usesSet[def] = append(usesSet[def], strings.TrimPrefix(pkg.Fset.Position(ident.Pos()).String(), rootPath+string(filepath.Separator)))
+	}
+
+	// Collect SDK
+	var sdkPkgPathList []string
+	for importedPkgPath := range pkg.Imports {
+		// Only target at Pandora SDK pkg import
+		if strings.Contains(importedPkgPath, "github.com/hashicorp/go-azure-sdk/resource-manager/") {
+			sdkPkgPathList = append(sdkPkgPathList, importedPkgPath)
+		}
+	}
+
+	if len(sdkPkgPathList) == 0 {
+		return
+	}
+
+	sdkSyncSet := map[types.Object]string{}
+	sdkAsyncSet := map[string]bool{}
+
+	for _, sdkPkgPath := range sdkPkgPathList {
+		if pkg.Imports[sdkPkgPath] == nil || pkg.Imports[sdkPkgPath].TypesInfo == nil {
+			return
+		}
+
+		for ident, def := range pkg.Imports[sdkPkgPath].TypesInfo.Defs {
+			if !strings.Contains(ident.Name, "Create") &&
+				!strings.Contains(ident.Name, "CreateOrUpdate") &&
+				!strings.Contains(ident.Name, "Update") &&
+				!strings.Contains(ident.Name, "Delete") {
+				continue
+			}
+
+			isPrivateMethod := false
+
+			// private method is out of the scan scope
+			for _, v := range ident.Name {
+				if unicode.IsLower(v) {
+					isPrivateMethod = true
+					break
+				}
+
+				break
+			}
+
+			if isPrivateMethod {
+				continue
+			}
+
+			if strings.Contains(ident.Name, "ThenPoll") {
+				sdkAsyncSet[def.Type().(*types.Signature).Recv().Type().String()+"."+ident.Name] = true
+			} else {
+				sdkSyncSet[def] = ident.Name
+			}
+		}
+	}
+
+	// Identify the existence of CRUDThenPoll if they have counterpart sync CRUD in SDK and those sync CRUD are used
+	// Canonical comparison is used in comparing sync SDK def and uses, while is not used in comparing sync SDK and async SDK
+	// for the two def objects are different.
+	for usesDef, pos := range usesSet {
+		if sdkIdentName, exist := sdkSyncSet[usesDef]; exist {
+
+			sig, ok := usesDef.Type().(*types.Signature)
 			if !ok {
-				return true
+				continue
 			}
 
-			if len(asnmt.Rhs) != 1 {
-				return true
-			}
-
-			callExpr, ok := asnmt.Rhs[0].(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-
-			selExpr, ok := callExpr.Fun.(*ast.SelectorExpr)
-			if !ok {
-				return true
-			}
-
-			selExprName := selExpr.Sel.Name
-
-			if !strings.Contains(selExprName, "Create") &&
-				!strings.Contains(selExprName, "CreateOrUpdate") &&
-				!strings.Contains(selExprName, "Update") &&
-				!strings.Contains(selExprName, "Delete") {
-				return true
-			}
-
-			//nanxu: There is null pointer exception after loosing the above check bar from == to Contains()
-
-			// "ThenPoll being called implies the call is always correct."
-			if strings.HasSuffix(selExprName, "ThenPoll") {
-				return true
-			}
-
-			funcObj := pkg.TypesInfo.Uses[selExpr.Sel]
-
-			_, ok = funcObj.Type().(*types.Signature)
-			if !ok {
-				return true
-			}
-
-			signature, ok := funcObj.Type().(*types.Signature)
-			if !ok {
-				return true
-			}
-
-			recv := signature.Recv()
+			recv := sig.Recv()
 			if recv == nil {
-				return true
+				continue
 			}
 
-			if recv.Type() == nil {
-				return true
-			}
-
-			funcRecvType := signature.Recv().Type().String()
-			funcPkg := funcObj.Pkg()
-
-			// Use cache to reduce unnecessary ast traversal
-			if len(funcScanCache[funcRecvType]) > 0 {
-				pollFuncList := funcScanCache[funcRecvType]
-				for _, v := range pollFuncList {
-					if selExpr.Sel.Name+"ThenPoll" == v {
-						fmt.Println("Pandora Hit: " + strings.TrimPrefix(pkg.Fset.Position(asnmt.Pos()).String(), rootPath+string(filepath.Separator)))
-						break
-					}
-				}
-
-				return false
-			}
-
-			// Get Pandora SDK package containing the being called synchronized CRUD function, and verify whether there is also `ThenPoll()` function.
-			// If there is, then it's bug.
-			cfgInner := &packages.Config{Mode: packages.LoadSyntax}
-			pkgsInner, err := packages.Load(cfgInner, funcPkg.Path())
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "load: %v\n", err)
-				os.Exit(1)
-			}
-			if packages.PrintErrors(pkgsInner) > 0 {
-				os.Exit(1)
-			}
-
-			for _, pkgInner := range pkgsInner {
-				for _, f := range pkgInner.Syntax {
-					ast.Inspect(f, func(node ast.Node) bool {
-						funcDecl, ok := node.(*ast.FuncDecl)
-						if !ok {
-							return true
-						}
-
-						// CRUD and CRUDThenPoll function must have receiver in Pandora SDK, otherwise continue the ast iteration.
-						if funcDecl.Recv == nil {
-							return true
-						}
-
-						funcDeclRecvList := funcDecl.Recv.List
-						if funcDeclRecvList != nil && len(funcDeclRecvList) > 0 {
-							funcDeclName := funcDecl.Name.Name
-							if !strings.Contains(funcDeclName, "Create") && !strings.Contains(funcDeclName, "Update") && !strings.Contains(funcDeclName, "Delete") {
-								return true
-							}
-
-							if funcDeclRecvList[len(funcDeclRecvList)-1] == nil {
-								return true
-							}
-
-							recvType, ok := funcDeclRecvList[len(funcDeclRecvList)-1].Type.(*ast.Ident)
-							if !ok {
-								return true
-							}
-
-							/*
-								1. Cannot only use func name Create/Update/Delete to identify the unique function but need to add its pkg and receiver.
-								(there could be cases where unique receiver + func name exist in multiple pkgs, and they represent different services.)
-								2. Record which pkg + receiver has CRUD(ThenPoll) function
-							*/
-							funcScanCache[pkgInner.PkgPath+"."+recvType.Name] = append(funcScanCache[pkgInner.PkgPath+"."+recvType.Name], funcDeclName)
-						}
-						return false
-					})
+			if sdkAsyncSet[recv.Type().String()+"."+sdkIdentName+"ThenPoll"] {
+				for _, posItem := range pos {
+					fmt.Printf("Pandora Hit: %s\n", posItem)
 				}
 			}
-
-			if len(funcScanCache[funcRecvType]) > 0 {
-				/* Here is the trick: [CRUD pkg] Receiver Type == [CRUDThenPoll Pkg] pkgInner.PkgPath+"."+recvType.Name
-				e.g. 			 [CRUD pkg] funcRecvType: github.com/hashicorp/go-azure-sdk/resource-manager/fluidrelay/2022-05-26/fluidrelayservers.FluidRelayServersClient
-				     [CRUDThenPoll Pkg] pkgInner.PkgPath: github.com/hashicorp/go-azure-sdk/resource-manager/fluidrelay/2022-05-26/fluidrelayservers
-						[CRUDThenPoll Pkg] recvType.Name: FluidRelayServersClient
-				*/
-
-				pollFuncList := funcScanCache[funcRecvType]
-				for _, v := range pollFuncList {
-					// Find the case that CRUD() is called but its pandora SDK also contains CRUDThenPoll()
-					if selExpr.Sel.Name+"ThenPoll" == v {
-						fmt.Println("Pandora Hit: " + strings.TrimPrefix(pkg.Fset.Position(asnmt.Pos()).String(), rootPath+string(filepath.Separator)))
-					}
-				}
-			}
-
-			return false
-		})
+		}
 	}
 }
